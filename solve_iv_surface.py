@@ -82,50 +82,52 @@ def interpolate_smile(target_strikes, obs_strikes, obs_ivs, underlying):
         else:
             # Edge extrapolation: blend Akima derivative + 3-pt linear regression
             if tlm < slm[0]:
-                # left edge
                 if ak is not None:
                     try:
                         ak_slope = float(ak(slm[0], 1))
-                        v_ak = siv[0] + ak_slope * (tlm - slm[0])
                     except:
-                        v_ak = None
+                        ak_slope = None
                 else:
-                    v_ak = None
+                    ak_slope = None
 
                 n_pts = min(3, len(slm))
                 if n_pts >= 2:
                     c_lin = np.polyfit(slm[:n_pts], siv[:n_pts], 1)
-                    v_lin = np.polyval(c_lin, tlm)
+                    lin_slope = c_lin[0]
                 else:
-                    v_lin = siv[0]
+                    lin_slope = 0.0
 
-                if v_ak is not None:
-                    v = 0.3 * v_ak + 0.7 * v_lin
+                if ak_slope is not None:
+                    slope = 0.3 * ak_slope + 0.7 * lin_slope
                 else:
-                    v = v_lin
+                    slope = lin_slope
+
+                dist = slm[0] - tlm
+                v = siv[0] - slope * (1 - np.exp(-10.0 * dist)) / 10.0
 
             else:
-                # right edge
                 if ak is not None:
                     try:
                         ak_slope = float(ak(slm[-1], 1))
-                        v_ak = siv[-1] + ak_slope * (tlm - slm[-1])
                     except:
-                        v_ak = None
+                        ak_slope = None
                 else:
-                    v_ak = None
+                    ak_slope = None
 
                 n_pts = min(3, len(slm))
                 if n_pts >= 2:
                     c_lin = np.polyfit(slm[-n_pts:], siv[-n_pts:], 1)
-                    v_lin = np.polyval(c_lin, tlm)
+                    lin_slope = c_lin[0]
                 else:
-                    v_lin = siv[-1]
+                    lin_slope = 0.0
 
-                if v_ak is not None:
-                    v = 0.3 * v_ak + 0.7 * v_lin
+                if ak_slope is not None:
+                    slope = 0.3 * ak_slope + 0.7 * lin_slope
                 else:
-                    v = v_lin
+                    slope = lin_slope
+
+                dist = tlm - slm[-1]
+                v = siv[-1] + slope * (1 - np.exp(-10.0 * dist)) / 10.0
 
             if v > 0.005:
                 results[i] = v
