@@ -56,6 +56,18 @@ def interpolate_smile(target_strikes, obs_strikes, obs_ivs, underlying):
         except Exception:
             pass
 
+    # Quadratic polynomial if 3+ points
+    quad_coeff = None
+    if n_obs >= 3:
+        try:
+            quad_coeff = np.polyfit(slm, siv, 2)
+            if quad_coeff[0] < 0:  # Prevent concave (upside-down U) fits from crashing edge extrapolations
+                quad_coeff = None
+        except Exception:
+            pass
+
+    decay_rate = 5.0  # TUNE ME: Monotonic Exponential Slope Decay rate
+
     for i, tlm in enumerate(tgt_lm):
         is_interior = slm[0] <= tlm <= slm[-1]
 
@@ -63,11 +75,18 @@ def interpolate_smile(target_strikes, obs_strikes, obs_ivs, underlying):
             # Akima interpolation (best for interior)
             if ak is not None:
                 v = float(ak(tlm))
-                if not np.isnan(v) and v > 0.005:
-                    results[i] = v
+                if not np.isnan(v):
+                    results[i] = max(v, 0.001)
                     continue
 
-            # fallback: piecewise linear
+            # Quadratic fallback
+            if quad_coeff is not None:
+                v = float(np.polyval(quad_coeff, tlm))
+                if not np.isnan(v):
+                    results[i] = max(v, 0.001)
+                    continue
+
+            # fallback: piecewise linear (only if Akima and Quad completely failed)
             idx_b = np.searchsorted(slm, tlm) - 1
             idx_b = max(0, min(idx_b, len(slm) - 2))
             idx_a = idx_b + 1
@@ -76,19 +95,18 @@ def interpolate_smile(target_strikes, obs_strikes, obs_ivs, underlying):
                 v = siv[idx_b] * (1 - w) + siv[idx_a] * w
             else:
                 v = siv[idx_b]
-            if v > 0.005:
-                results[i] = v
+                
+            results[i] = max(v, 0.001)
 
         else:
-            # Edge extrapolation: blend Akima derivative + 3-pt linear regression
+            # Edge extrapolation: blend Akima/Quad derivative + 3-pt linear regression
             if tlm < slm[0]:
+                ak_slope = None
                 if ak is not None:
                     try:
                         ak_slope = float(ak(slm[0], 1))
                     except:
-                        ak_slope = None
-                else:
-                    ak_slope = None
+                        pass
 
                 n_pts = min(3, len(slm))
                 if n_pts >= 2:
@@ -99,20 +117,21 @@ def interpolate_smile(target_strikes, obs_strikes, obs_ivs, underlying):
 
                 if ak_slope is not None:
                     slope = 0.3 * ak_slope + 0.7 * lin_slope
+                elif quad_coeff is not None:
+                    slope = 2 * quad_coeff[0] * slm[0] + quad_coeff[1]
                 else:
                     slope = lin_slope
 
                 dist = slm[0] - tlm
-                v = siv[0] - slope * (1 - np.exp(-10.0 * dist)) / 10.0
+                v = siv[0] - slope * (1 - np.exp(-decay_rate * dist)) / decay_rate
 
             else:
+                ak_slope = None
                 if ak is not None:
                     try:
                         ak_slope = float(ak(slm[-1], 1))
                     except:
-                        ak_slope = None
-                else:
-                    ak_slope = None
+                        pass
 
                 n_pts = min(3, len(slm))
                 if n_pts >= 2:
@@ -123,17 +142,15 @@ def interpolate_smile(target_strikes, obs_strikes, obs_ivs, underlying):
 
                 if ak_slope is not None:
                     slope = 0.3 * ak_slope + 0.7 * lin_slope
+                elif quad_coeff is not None:
+                    slope = 2 * quad_coeff[0] * slm[-1] + quad_coeff[1]
                 else:
                     slope = lin_slope
 
                 dist = tlm - slm[-1]
-                v = siv[-1] + slope * (1 - np.exp(-10.0 * dist)) / 10.0
+                v = siv[-1] + slope * (1 - np.exp(-decay_rate * dist)) / decay_rate
 
-            if v > 0.005:
-                results[i] = v
-            else:
-                # clamp to nearest observed
-                results[i] = siv[0] if tlm < slm[0] else siv[-1]
+            results[i] = max(v, 0.001)
 
     return results
 
@@ -144,15 +161,10 @@ for row_idx in range(len(df)):
     underlying = df.loc[row_idx, 'underlying_price']
 
     observed_mask = {c: not pd.isna(df.loc[row_idx, c]) for c in feature_cols}
-    for c in feature_cols:
-        if observed_mask[c]:
-            last_known[c] = df.loc[row_idx, c]
-
     missing_ce = [c for c in ce_cols if not observed_mask[c]]
     missing_pe = [c for c in pe_cols if not observed_mask[c]]
 
-    if not missing_ce and not missing_pe:
-        continue
+    # Removed early continue to ensure last_known gets updated even if no missing values exist
 
     for otype, cols, strikes_arr, missing in [
         ('CE', ce_cols, ce_strikes_arr, missing_ce),
@@ -162,8 +174,9 @@ for row_idx in range(len(df)):
             continue
 
         obs_mask = [observed_mask[c] for c in cols]
+        obs_cols = [c for c, m in zip(cols, obs_mask) if m]
         obs_strikes = strikes_arr[obs_mask]
-        obs_ivs = np.array([df.loc[row_idx, c] for c, m in zip(cols, obs_mask) if m])
+        obs_ivs = np.array([df.loc[row_idx, c] for c in obs_cols])
         miss_strikes = np.array([col_info[c]['strike'] for c in missing], dtype=float)
 
         estimated = (
@@ -182,6 +195,15 @@ for row_idx in range(len(df)):
             else:
                 all_last = [last_known[cc] for cc in cols if not np.isnan(last_known[cc])]
                 filled.loc[row_idx, c] = np.median(all_last) if all_last else 0.12
+
+    # CRITICAL FIX: Update last_known AT THE END of the row
+    # using the FILLED values. This ensures that options missing for long periods
+    # carry forward the most recent structurally interpolated smile, rather than
+    # being stuck with days-old stale IVs!
+    for c in feature_cols:
+        val = filled.loc[row_idx, c]
+        if not pd.isna(val):
+            last_known[c] = val
 
 remaining = filled[feature_cols].isna().sum().sum()
 assert remaining == 0
